@@ -43,7 +43,10 @@ We start with the observation that there are two types of MCP tools:
 
 The vast majority of MCP tools will be ephemeral, and it is extremely
 common for tools to be deployed in a horizontally scaled, load balanced
-service, so we need to optimize for this case.
+service, so we need to optimize for this case by making it more
+stateless.
+
+### 1. Remove the Statefulness of Server "Stickiness"
 
 Today, if a tool needs to send an elicitation request in order to make
 progress, the workflow works like this:
@@ -107,6 +110,41 @@ There are two main approaches that can be used to solve this problem today:
 Also, both of these approaches rely on the use of an SSE stream, which
 causes problems in environments that cannot support long-lived
 connections.
+
+### 2. Remove any requirement that the server maintain state
+
+Beyond server stickiness, the current protocol also requires servers to
+maintain durable state for server-initiated requests that await client
+responses.  This is particularly problematic for requests with unbounded
+response times, such as elicitation requests, where a user may take
+minutes or hours to respond.
+
+Implementing durable state storage imposes significant operational
+burdens:
+
+- **Infrastructure Requirements:** Servers must deploy and manage a
+  persistent data store (e.g., PostgreSQL, Redis, DynamoDB) with high
+  availability, replication, and backup mechanisms.  This is not a
+  simple in-memory cache but must survive server restarts and failures.
+- **Operational Complexity:** State synchronization in distributed
+  deployments requires distributed locking or consensus protocols.
+  Garbage collection logic is needed to clean up orphaned state,
+  typically using TTL mechanisms that create a fundamental tradeoff:
+  short TTLs reduce storage costs but limit how long users have to
+  respond, while long TTLs accommodate slow users but increase storage
+  requirements.
+- **Scalability Limitations:** The state store becomes a bottleneck,
+  limiting horizontal scaling.  Geographic distribution requires either
+  expensive global replication or sticky routing.
+- **Reliability Concerns:** The state store becomes a critical
+  dependency and single point of failure.
+
+With `request_state`, servers can encode all necessary context directly
+in the incomplete response.  When the client echoes this opaque state
+back on the retry, any server instance can immediately process the
+request without consulting any external storage.  This transforms
+server-initiated requests from stateful, distributed transactions into
+simple, self-contained request-response pairs.
 
 The goal of this SEP is to propose a simpler way to handle the pattern
 of server-initiated requests within the context of a client-initiated
@@ -681,6 +719,272 @@ duration of the task, and there is no way to transition back to the
 ephemeral model.  All subsequent interactions must be performed via the
 Tasks API.
 
+### Request State
+
+Second, we add a field `request_state` to the top level of the request
+object.  The `request_state` field is an opaque string that allows
+servers to pass continuation context through the client without
+maintaining any server-side storage.
+
+#### Protocol Requirements
+
+1. **Server Behavior:**
+   - Servers MAY include a `request_state` field in any
+     `JSONRPCIncompleteResultResponse`.
+   - The `request_state` value is an opaque string that is meaningful
+     only to the server.
+   - Servers are free to encode the state in any format (e.g., plain
+     JSON, base64-encoded JSON, encrypted JWT, serialized binary, etc.).
+
+2. **Client Behavior:**
+   - Clients MUST echo back the exact `request_state` value received in
+     a `JSONRPCIncompleteResultResponse` when retrying the original
+     request.
+   - Clients MUST NOT inspect, parse, modify, or make any assumptions
+     about the `request_state` contents.
+   - If the incomplete response does not contain a `request_state`
+     field, the client MUST NOT include one in the retry.
+
+For example, if the server returns:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "input_requests": {
+    "confirm": {
+      "method": "elicitation/create",
+      "params": {
+        "message": "Please confirm this action",
+        "requestedSchema": {
+          "type": "object",
+          "properties": { "ok": { "type": "boolean" } },
+          "required": ["ok"]
+        }
+      }
+    }
+  },
+  "request_state": "eyJ3b3JrSXRlbUlkIjo0NTIyfQ..."
+}
+```
+
+Then the client MUST include the same `request_state` when retrying:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "update_work_item",
+    "arguments": { "workItemId": 4522 }
+  },
+  "input_responses": {
+    "confirm": {
+      "result": { "action": "accept", "content": { "ok": true } }
+    }
+  },
+  "request_state": "eyJ3b3JrSXRlbUlkIjo0NTIyfQ..."
+}
+```
+
+#### Security Considerations for Request State
+
+Since `request_state` passes through the client, malicious or
+compromised clients could attempt to modify it to alter server behavior,
+bypass authorization checks, or corrupt server logic.
+
+**Mitigation:** Servers MUST always validate state received from the
+client, as the client is an untrusted intermediary.  If tampering is a
+concern, servers SHOULD encrypt the `request_state` field (e.g., using
+AES-GCM or a signed JWT) to ensure both confidentiality and integrity.
+Servers using plaintext state MUST treat the decoded values as untrusted
+input and validate them the same way they would validate any
+client-supplied data.
+
+### Example: Multi-Round-Trip Elicitation with Azure DevOps Custom Rules
+
+This example demonstrates how `request_state` enables a multi-round-trip
+elicitation flow driven by [Azure DevOps custom
+rules](https://learn.microsoft.com/en-us/azure/devops/organizations/settings/work/custom-rules?view=azure-devops).
+The scenario involves an `update_work_item` tool that transitions a Bug
+work item to "Resolved."  ADO custom rules require specific fields when
+certain state transitions occur, and the server uses iterative
+elicitation to gather them — accumulating context in `request_state`
+across rounds so that the final update can be executed without any
+server-side storage.
+
+**Background — ADO Custom Rules in effect:**
+- *Rule 1:* When State changes to "Resolved" → require the "Resolution"
+  field (e.g., Fixed, Won't Fix, Duplicate, By Design).
+- *Rule 2:* When Resolution is "Duplicate" → require the "Duplicate Of"
+  field (a link to the original work item).
+
+#### Round 1 — Tool call triggers state change, server elicits Resolution
+
+1. The client invokes the `update_work_item` tool to resolve Bug #4522:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "update_work_item",
+    "arguments": {
+      "workItemId": 4522,
+      "fields": { "System.State": "Resolved" }
+    }
+  }
+}
+```
+
+2. The server recognizes that setting State to "Resolved" triggers
+   Rule 1, which requires a Resolution value.  Rather than failing the
+   call, the server returns an incomplete response with an elicitation
+   request.  No `request_state` is needed yet, since the original tool
+   call arguments will be re-sent on retry:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "input_requests": {
+    "resolution": {
+      "method": "elicitation/create",
+      "params": {
+        "message": "Resolving Bug #4522 requires a resolution. How was this bug resolved?",
+        "requestedSchema": {
+          "type": "object",
+          "properties": {
+            "resolution": {
+              "type": "string",
+              "enum": ["Fixed", "Won't Fix", "Duplicate", "By Design"],
+              "description": "Resolution type for this bug"
+            }
+          },
+          "required": ["resolution"]
+        }
+      }
+    }
+  }
+}
+```
+
+3. The user selects "Duplicate".  The client retries the original tool
+   call with the elicitation response:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "update_work_item",
+    "arguments": {
+      "workItemId": 4522,
+      "fields": { "System.State": "Resolved" }
+    }
+  },
+  "input_responses": {
+    "resolution": {
+      "result": {
+        "action": "accept",
+        "content": { "resolution": "Duplicate" }
+      }
+    }
+  }
+}
+```
+
+#### Round 2 — Resolution triggers another rule, server elicits Duplicate Of
+
+4. The server merges the user's response and sees that Resolution =
+   "Duplicate" triggers Rule 2, requiring a "Duplicate Of" link.  It
+   returns another incomplete response, this time encoding the
+   already-gathered resolution in `request_state` so it is available
+   regardless of which server instance handles the next retry:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "input_requests": {
+    "duplicate_of": {
+      "method": "elicitation/create",
+      "params": {
+        "message": "Since this is a duplicate, which work item is the original?",
+        "requestedSchema": {
+          "type": "object",
+          "properties": {
+            "duplicateOfId": {
+              "type": "number",
+              "description": "Work item ID of the original bug"
+            }
+          },
+          "required": ["duplicateOfId"]
+        }
+      }
+    }
+  },
+  "request_state": "eyJyZXNvbHV0aW9uIjoiRHVwbGljYXRlIn0..."
+}
+```
+
+5. The user provides the original work item ID.  The client retries the
+   tool call, echoing back the `request_state` and including the new
+   elicitation response:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "update_work_item",
+    "arguments": {
+      "workItemId": 4522,
+      "fields": { "System.State": "Resolved" }
+    }
+  },
+  "input_responses": {
+    "duplicate_of": {
+      "result": {
+        "action": "accept",
+        "content": { "duplicateOfId": 4301 }
+      }
+    }
+  },
+  "request_state": "eyJyZXNvbHV0aW9uIjoiRHVwbGljYXRlIn0..."
+}
+```
+
+#### Final — Server completes the update
+
+6. The server decodes the `request_state` (which contains the
+   resolution), reads the `input_responses` (which contains the
+   duplicate ID), and now has all required fields.  It completes the
+   tool call:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Bug #4522 resolved as Duplicate of Bug #4301. State set to Resolved and duplicate link created."
+      }
+    ],
+    "isError": false
+  }
+}
+```
+
+**Key takeaway:** Across both elicitation rounds, the server held no
+in-memory or persisted state.  The `request_state` field carried the
+accumulated context through the client, and any server instance could
+have handled any individual round.
+
 ## Rationale
 
 We considered a bidirectional stream approach to replace SSE streams.
@@ -729,7 +1033,11 @@ backward compatibility layer.
 
 ## Security Implications
 
-This proposal is not expected to introduce any security implications.
+Since `request_state` passes through the client (an untrusted
+intermediary), servers MUST validate all state received from the client.
+See [Security Considerations for Request
+State](#security-considerations-for-request-state) above for details on
+tampering mitigation.
 
 ## Reference Implementation
 
